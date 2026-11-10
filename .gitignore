@@ -1,0 +1,25 @@
+# Données HMD (redistribution interdite)
+*_1x1.txt
+
+# Sorties générées par R Markdown
+*.html
+*_files/
+*_cache/
+*.knit.md
+*.utf8.md
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# Système
+.DS_Store
+Thumbs.db

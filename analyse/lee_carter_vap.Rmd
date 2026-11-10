@@ -1,0 +1,737 @@
+---
+title: |
+  **Projet Actuariat Vie**  
+  Calcul de la Valeur Actuelle Probable  
+  d'une Rente Viagère à Termes Échus
+subtitle: |
+  Cohortes 1935 et 1950 — Données HMD France  
+author: |
+  Hidaya Hanafi · Hedi Brahmi · Imen Dridi · Yassine Selmi  
+  Groupe 3 — 4DS11
+date: "Année universitaire 2025-2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+    keep_tex: true
+bibliography: references.bib
+link-citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+---
+
+# Déclaration d'usage de l'IA générative {-}
+
+> Conformément aux recommandations du projet [@Matoussi2026], nous déclarons
+> avoir utilisé des outils d'IA générative (Claude, Anthropic) pour :
+>
+> - La structuration initiale du rapport et la mise en forme Rmd
+> - La suggestion d'exemples de code R (adaptés et vérifiés par le groupe)
+> - La relecture orthographique et grammaticale
+>
+> L'ensemble des analyses, interprétations, choix de modèles et conclusions
+> sont le fruit du travail du groupe et s'appuient sur les références
+> bibliographiques citées dans ce rapport.
+
+---
+
+# Introduction
+
+## Contexte et objectif
+
+Le risque de longévité est au cœur des préoccupations des assureurs vie.
+Un assureur qui commercialise des **rentes viagères** s'engage à verser une
+pension à l'assuré aussi longtemps qu'il reste en vie. Si les assurés vivent
+plus longtemps que prévu, l'assureur fait face à des engagements supérieurs
+à ceux provisionnés.
+
+Dans ce projet, nous étudions deux cohortes d'assurés masculins français :
+
+| Cohorte | Année de naissance | Début du contrat | Âge au contrat |
+|---------|-------------------|-----------------|----------------|
+| 1       | **1935**          | **2000**        | 65 ans         |
+| 2       | **1950**          | **2015**        | 65 ans         |
+
+L'objectif est d'utiliser le **modèle de Lee-Carter** [@LeeCarter1992]
+pour projeter la mortalité future et calculer la **Valeur Actuelle Probable
+(VAP)** d'une rente viagère à termes échus pour chaque cohorte.
+
+## Répartition des tâches
+
+| Membre | Rôle | Questions traitées |
+|--------|------|-------------------|
+| Hedi Brahmi|Data & Modélisation |Téléchargement données HMD + Estimation Lee-Carter (MLE log-Poisson) + Q1 + Q2 (cohorte 1935) + Q3 (cohorte 1935) |
+| Imen Dridi | Estimation & Simulation |  Estimation des parametres Lee Carter + Q2 (cohorte 1950) + Q3 (cohorte 1950)+ Q4 + graphique de zoom sur la cohorte 1950 | 
+| Yassine Selmi | Actuariat – Calcul VAP | Formule rente viagère à termes échus + Calcul VAP cohorte 1935 + Q5 (cohorte 1935) + théorie VAP |
+| Hidaya Hanafi | Coordination & Interprétation |VAP cohorte 1950 + Tarification avec marge de sécurité + Q5 (cohorte 1950) + Q6 + Q7 + assemblage |
+
+---
+
+# Chargement des packages et des données
+
+## Packages utilisés
+
+```{r packages}
+library(demography)        # Manipulation des données démographiques HMD
+library(StMoMo)            # Modèles stochastiques de mortalité (Lee-Carter)
+library(forecast)          # Projection des séries temporelles (kt)
+library(ggplot2)           # Visualisation avancée
+library(gridExtra)         # Mise en page de plusieurs graphiques
+```
+
+## Téléchargement des données HMD {#sec-q1}
+
+> **Question 1 — Télécharger les données pour le pays concerné.**
+
+Les données sont issues de la **Human Mortality Database** (HMD)
+[@HMD2024], base de référence mondiale pour les données de mortalité.
+Nous utilisons les fichiers France (hommes, population totale) :
+
+- `Mx_1x1.txt` : taux bruts de mortalité par âge et par année
+- `Exposures_1x1.txt` : expositions au risque correspondantes
+
+Le taux brut de mortalité est défini comme :
+$$\mu_{x,t} = \frac{d_{x,t}}{E_{x,t}}$$
+
+```{r chargement-donnees}
+# Détection automatique de l'en-tête (robuste à tous les formats HMD)
+lignes   <- readLines("Mx_1x1.txt", encoding = "latin1")
+idx      <- which(grepl("Year|year|YEAR", lignes) |
+                  grepl("Age\\s+Female|Age\\s+Male", lignes))[1]
+mx       <- read.table("Mx_1x1.txt", header=TRUE, skip=idx-1,
+                       na.strings=c(".","NA",""), stringsAsFactors=FALSE,
+                       encoding="latin1", fill=TRUE)
+
+lignes_expo <- readLines("Exposures_1x1.txt", encoding="latin1")
+idx_expo    <- which(grepl("Year|year|YEAR", lignes_expo) |
+                     grepl("Age\\s+Female|Age\\s+Male", lignes_expo))[1]
+expo        <- read.table("Exposures_1x1.txt", header=TRUE, skip=idx_expo-1,
+                          na.strings=c(".","NA",""), stringsAsFactors=FALSE,
+                          encoding="latin1", fill=TRUE)
+
+mx$OpenInterval <- NULL
+expo$OpenInterval <- NULL
+
+cat("Plage d'âges  :", min(mx$Age), "à", max(mx$Age), "\n")
+cat("Plage d'années:", min(mx$Year), "à", max(mx$Year), "\n")
+cat("Dimensions    :", nrow(mx), "lignes ×", ncol(mx), "colonnes\n")
+```
+
+```{r creation-demogdata}
+ages  <- sort(unique(mx$Age))
+years <- sort(unique(mx$Year))
+
+fr_male <- demogdata(
+  data  = xtabs(mx$Male   ~ mx$Age   + mx$Year),
+  pop   = xtabs(expo$Male ~ expo$Age + expo$Year),
+  ages  = ages, years = years,
+  type  = "mortality", label = "France", name = "male"
+)
+fr_male$lambda <- 0
+cat("Objet demogdata :", length(fr_male$age), "âges ×",
+    length(fr_male$year), "années\n")
+```
+
+---
+
+# Estimation des taux de mortalité {#sec-q2}
+
+> **Question 2 — Estimer les taux de mortalité et tracer avec IC 99%.**
+
+## Cadre théorique : le modèle de Lee-Carter
+
+Le modèle de Lee-Carter [@LeeCarter1992] postule :
+$$\log(\mu_{x,t}) = a_x + b_x k_t + \varepsilon_{x,t}$$
+
+L'estimation est réalisée par maximum de vraisemblance sous l'hypothèse
+log-Poisson [@Brouhns2002], implémentée dans `StMoMo` [@Villegas2018].
+
+## Ajustement du modèle
+
+```{r ajustement-lc}
+fr_male_filtered <- extract.years(fr_male, years = 1950:2020)
+stmomo_data      <- StMoMoData(fr_male_filtered, series = "male")
+
+LC    <- lc(link = "log")   # log-Poisson = Brouhns et al. (2002)
+LCfit <- fit(LC, data = stmomo_data,
+             ages.fit = 60:100, years.fit = 1950:2020)
+
+cat("Lee-Carter ajusté : âges", min(LCfit$ages), "à", max(LCfit$ages),
+    "| années", min(LCfit$years), "à", max(LCfit$years), "\n")
+```
+
+## Paramètres $a_x$, $b_x$, $k_t$
+
+```{r parametres-lc, fig.height=5}
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+
+plot(LCfit$ages, LCfit$ax, type="l", lwd=2, col="steelblue",
+     main=expression(paste("Paramètre ",a[x]," (niveau)")),
+     xlab="Âge", ylab=expression(a[x])); grid()
+
+plot(LCfit$ages, LCfit$bx, type="l", lwd=2, col="darkgreen",
+     main=expression(paste("Paramètre ",b[x]," (sensibilité)")),
+     xlab="Âge", ylab=expression(b[x])); grid()
+
+plot(LCfit$years, LCfit$kt[1,], type="l", lwd=2, col="firebrick",
+     main=expression(paste("Indice temporel ",k[t])),
+     xlab="Année", ylab=expression(k[t]))
+abline(h=0, lty=2); grid()
+```
+
+**Interprétation :**
+$a_x$ croît exponentiellement avec l'âge (loi de Gompertz [@Matoussi2026]).
+$b_x$ est maximal aux âges moyens. $k_t$ décroît, traduisant l'amélioration
+continue de la longévité sur 1950-2020.
+
+
+
+
+## Simulation N=5000 et reconstruction des taux ajustés
+
+```{r simulation-et-fitted, cache=TRUE}
+# --- Simulation 5000 trajectoires sur 25 ans ---
+set.seed(2024)
+LCsim <- simulate(LCfit, nsim=5000, h=25, seed=2024)
+
+cat("Simulation : âges", min(LCsim$ages), "à", max(LCsim$ages),
+    "| années", min(LCsim$years), "à", max(LCsim$years),
+    "| N =", dim(LCsim$rates)[3], "\n")
+
+# --- Reconstruction des taux ajustés : mu(x,t) = exp(ax + bx*kt) ---
+# LCfit$rates n'existe pas dans StMoMo → calcul depuis les paramètres
+n_ages  <- length(LCfit$ages)
+n_years <- length(LCfit$years)
+mu_fitted_mat <- matrix(0, nrow=n_ages, ncol=n_years)
+for (t in seq_along(LCfit$years)) {
+  mu_fitted_mat[, t] <- exp(LCfit$ax + LCfit$bx * LCfit$kt[1, t])
+}
+rownames(mu_fitted_mat) <- as.character(LCfit$ages)
+colnames(mu_fitted_mat) <- as.character(LCfit$years)
+
+cat("Taux ajustés reconstruits : µ(65,2000) =",
+    round(mu_fitted_mat["65","2000"], 5), "\n")
+```
+
+## Fonction d'extraction des trajectoires de cohorte
+
+```{r fonction-trajectoire}
+# Combine mu_fitted_mat (1950-2020) et LCsim$rates (2021-2045)
+# pour reconstituer la trajectoire diagonale d'une cohorte
+get_cohort_trajectory <- function(contract_year, age_contrat=65,
+                                   T_proj=25, mu_fitted_mat, LCsim,
+                                   sim_idx=NULL) {
+  mu_vec <- numeric(T_proj)
+  for (k in 0:(T_proj-1)) {
+    age_str  <- as.character(age_contrat + k)
+    year_str <- as.character(contract_year + k)
+    if (age_str %in% rownames(mu_fitted_mat) &&
+        year_str %in% colnames(mu_fitted_mat)) {
+      # Année historique (≤2020) → taux ajustés par paramètres
+      mu_vec[k+1] <- mu_fitted_mat[age_str, year_str]
+    } else if (age_str %in% as.character(LCsim$ages) &&
+               year_str %in% as.character(LCsim$years)) {
+      # Année future (2021-2045) → taux simulés
+      if (is.null(sim_idx)) {
+        mu_vec[k+1] <- median(LCsim$rates[age_str, year_str, ])
+      } else {
+        mu_vec[k+1] <- LCsim$rates[age_str, year_str, sim_idx]
+      }
+    } else {
+      mu_vec[k+1] <- NA
+    }
+  }
+  return(mu_vec)
+}
+```
+
+## Calcul des IC 99% et graphiques Q2
+
+```{r ic-et-graphiques-q2, cache=TRUE, fig.height=5}
+ages_plot <- 65:89  # 25 ans de contrat
+
+# Cohorte 1935 : médiane + 5000 scénarios
+mu_1935_med <- get_cohort_trajectory(2000,
+                 mu_fitted_mat=mu_fitted_mat, LCsim=LCsim)
+mu_1935_mat <- t(sapply(1:5000, function(s)
+  get_cohort_trajectory(2000, mu_fitted_mat=mu_fitted_mat,
+                        LCsim=LCsim, sim_idx=s)))
+
+# Cohorte 1950 : médiane + 5000 scénarios
+mu_1950_med <- get_cohort_trajectory(2015,
+                 mu_fitted_mat=mu_fitted_mat, LCsim=LCsim)
+mu_1950_mat <- t(sapply(1:5000, function(s)
+  get_cohort_trajectory(2015, mu_fitted_mat=mu_fitted_mat,
+                        LCsim=LCsim, sim_idx=s)))
+
+cat("NAs 1935 :", sum(is.na(mu_1935_med)),
+    "| NAs 1950 :", sum(is.na(mu_1950_med)), "\n")
+
+# IC 99%
+ic99_1935_low  <- apply(mu_1935_mat, 2, quantile, 0.005, na.rm=TRUE)
+ic99_1935_high <- apply(mu_1935_mat, 2, quantile, 0.995, na.rm=TRUE)
+ic99_1950_low  <- apply(mu_1950_mat, 2, quantile, 0.005, na.rm=TRUE)
+ic99_1950_high <- apply(mu_1950_mat, 2, quantile, 0.995, na.rm=TRUE)
+
+# --- GRAPHIQUE Q2 ---
+par(mfrow=c(1,2), mar=c(4,4,4,1))
+
+# Cohorte 1935
+ylim_1935 <- range(log(c(ic99_1935_low, ic99_1935_high)), na.rm=TRUE)
+plot(ages_plot, log(mu_1935_med), type="l", lwd=2, col="steelblue",
+     ylim=ylim_1935,
+     main="Cohorte 1935 — Log taux + IC 99%\n(contrat 2000, âge 65)",
+     xlab="Âge", ylab=expression(log(mu[x])))
+polygon(c(ages_plot, rev(ages_plot)),
+        c(log(ic99_1935_low), rev(log(ic99_1935_high))),
+        col=rgb(0.2,0.4,0.8,0.2), border=NA)
+lines(ages_plot, log(ic99_1935_low),  col="steelblue", lty=2)
+lines(ages_plot, log(ic99_1935_high), col="steelblue", lty=2)
+lines(ages_plot, log(mu_1935_med), col="steelblue", lwd=2)
+abline(v=2020-2000+65, col="gray40", lty=3)
+legend("topleft", legend=c("Médiane","IC 99%"),
+       col=c("steelblue",rgb(0.2,0.4,0.8,0.5)), lwd=c(2,8), bty="n")
+grid()
+
+# Cohorte 1950
+ylim_1950 <- range(log(c(ic99_1950_low, ic99_1950_high)), na.rm=TRUE)
+plot(ages_plot, log(mu_1950_med), type="l", lwd=2, col="firebrick",
+     ylim=ylim_1950,
+     main="Cohorte 1950 — Log taux + IC 99%\n(contrat 2015, âge 65)",
+     xlab="Âge", ylab=expression(log(mu[x])))
+polygon(c(ages_plot, rev(ages_plot)),
+        c(log(ic99_1950_low), rev(log(ic99_1950_high))),
+        col=rgb(0.8,0.2,0.2,0.2), border=NA)
+lines(ages_plot, log(ic99_1950_low),  col="firebrick", lty=2)
+lines(ages_plot, log(ic99_1950_high), col="firebrick", lty=2)
+lines(ages_plot, log(mu_1950_med), col="firebrick", lwd=2)
+abline(v=2020-2015+65, col="gray40", lty=3)
+legend("topleft", legend=c("Médiane","IC 99%"),
+       col=c("firebrick",rgb(0.8,0.2,0.2,0.5)), lwd=c(2,8), bty="n")
+grid()
+```
+
+# Zoom et mise en forme alternative ggplot2
+```{r}
+rates_male <- fr_male$rate$male
+expo_male  <- fr_male$pop$male
+ages_c <- 65:70
+annees_c <- 1950 + ages_c
+
+mx_obs_50   <- mapply(function(a, y) rates_male[as.character(a), as.character(y)], ages_c, annees_c)
+expo_obs_50 <- mapply(function(a, y) expo_male[as.character(a), as.character(y)], ages_c, annees_c)
+mx_lc_50    <- mu_1950_med[1:length(ages_c)]
+
+# Formulation de l'IC de Poisson 
+se_lc_50 <- sqrt(mx_lc_50 / expo_obs_50)
+z99      <- qnorm(0.995)
+
+df_m2 <- data.frame(
+  age    = ages_c,
+  mx_obs = mx_obs_50,
+  mx_lc  = mx_lc_50,
+  ic_low = pmax(mx_lc_50 - z99 * se_lc_50, 0),
+  ic_up  = mx_lc_50 + z99 * se_lc_50
+)
+
+ggplot(df_m2, aes(x = age)) +
+  geom_ribbon(aes(ymin = ic_low, ymax = ic_up), fill = "#AED6F1", alpha = 0.6) +
+  geom_line(aes(y = mx_lc, colour = "Estimé Lee-Carter"), linewidth = 1.2) +
+  geom_point(aes(y = mx_obs, colour = "Observé (HMD)"), size = 1.8, shape = 16) +
+  scale_colour_manual(values = c("Estimé Lee-Carter" = "#2C7BB6", "Observé (HMD)" = "#D7191C")) +
+  labs(
+    title    = "Focus Cohorte 1950 (hommes) — Taux de mortalité et IC 99 % (Poisson)",
+    subtitle = "Ajustement sur la période historique commune du contrat",
+    x        = "Âge", y = expression(hat(mu)[x]), colour = NULL
+  ) + 
+  theme_minimal(base_size = 11) + 
+  theme(legend.position = "top", plot.title = element_text(face = "bold"))
+```
+
+
+---
+
+# Log taux historiques des cohortes {#sec-q3}
+
+> **Question 3 — Afficher les log taux historiques avec `extractCohort`
+> et comparer aux taux estimés.**
+
+```{r extract-cohort-q3, fig.height=5}
+# extractCohort de StMoMo n'accepte pas les objets StMoMoData dans cette version
+# → extraction manuelle équivalente : µ(x,t) = D(x,t)/E(x,t), t = naissance + x
+
+extract_cohort_manual <- function(stmomo_data, birth_year,
+                                   age_min=65, age_max=100) {
+  ages_sel <- stmomo_data$ages[stmomo_data$ages >= age_min &
+                                stmomo_data$ages <= age_max]
+  result <- c(); ages_found <- c()
+  for (x in ages_sel) {
+    yr       <- birth_year + x
+    age_str  <- as.character(x)
+    year_str <- as.character(yr)
+    if (age_str %in% rownames(stmomo_data$Dxt) &&
+        year_str %in% colnames(stmomo_data$Dxt)) {
+      Ext <- stmomo_data$Ext[age_str, year_str]
+      Dxt <- stmomo_data$Dxt[age_str, year_str]
+      if (!is.na(Ext) && Ext > 0) {
+        result     <- c(result, Dxt/Ext)
+        ages_found <- c(ages_found, x)
+      }
+    }
+  }
+  names(result) <- as.character(ages_found)
+  return(result)
+}
+
+cohort_1935_obs <- extract_cohort_manual(stmomo_data, 1935)
+cohort_1950_obs <- extract_cohort_manual(stmomo_data, 1950)
+ages_obs_1935   <- as.numeric(names(cohort_1935_obs))
+ages_obs_1950   <- as.numeric(names(cohort_1950_obs))
+
+cat("Cohorte 1935 : âges", min(ages_obs_1935), "à", max(ages_obs_1935),
+    "(", length(ages_obs_1935), "points observés)\n")
+cat("Cohorte 1950 : âges", min(ages_obs_1950), "à", max(ages_obs_1950),
+    "(", length(ages_obs_1950), "points observés)\n")
+
+# --- GRAPHIQUE Q3 : observé vs ajusté ---
+par(mfrow=c(1,2), mar=c(4,4,4,1))
+
+# Cohorte 1935
+plot(ages_obs_1935, log(cohort_1935_obs),
+     type="p", pch=16, cex=0.9, col="steelblue",
+     main="Cohorte 1935 : observé vs ajusté\n(Lee-Carter, 2000-2020)",
+     xlab="Âge", ylab=expression(log(mu[x])))
+lines(ages_plot, log(mu_1935_med), col="firebrick", lwd=2)
+grid()
+legend("topleft",
+       legend=c("Taux HMD observés","Ajusté Lee-Carter"),
+       col=c("steelblue","firebrick"),
+       pch=c(16,NA), lty=c(NA,1), lwd=c(NA,2), bty="n")
+
+# Cohorte 1950
+n50 <- length(ages_obs_1950)
+plot(ages_obs_1950, log(cohort_1950_obs),
+     type="p", pch=16, cex=0.9, col="firebrick",
+     main="Cohorte 1950 : observé vs ajusté\n(Lee-Carter, 2015-2020)",
+     xlab="Âge", ylab=expression(log(mu[x])))
+lines(ages_plot[1:n50], log(mu_1950_med[1:n50]),
+      col="steelblue", lwd=2)
+grid()
+legend("topleft",
+       legend=c("Taux HMD observés","Ajusté Lee-Carter"),
+       col=c("firebrick","steelblue"),
+       pch=c(16,NA), lty=c(NA,1), lwd=c(NA,2), bty="n")
+```
+
+Le modèle de Lee-Carter s'ajuste fidèlement aux données historiques.
+Pour la cohorte 1950, les données observées s'arrêtent à l'âge 70 (2020),
+le reste étant projeté [@Matoussi2026].
+
+---
+
+# Simulation des trajectoires futures {#sec-q4}
+
+> **Question 4 — Simuler N=5000 trajectoires sur 25 ans et afficher les
+> log taux historiques à partir de la date de début du contrat.**
+
+Les 5000 simulations ont été produites à la section précédente via
+`simulate(LCfit, nsim=5000, h=25)`.
+$k_t$ est projeté par **marche aléatoire avec dérive** [@LeeCarter1992] :
+$$k_t = k_{t-1} + d + e_t, \quad e_t \sim \mathcal{N}(0, \sigma_e^2)$$
+
+## Cohorte 1935 — depuis le contrat 2000
+
+```{r visu-sim-1935, fig.height=5}
+plot(ages_obs_1935, log(cohort_1935_obs),
+     type="p", pch=16, cex=0.8, col="black",
+     main="Cohorte 1935 — Historique + trajectoires simulées\n(depuis 2000)",
+     xlab="Âge", ylab=expression(log(mu[x])),
+     xlim=c(65,90), ylim=c(-6,0))
+for (s in 1:100)
+  lines(ages_plot, log(mu_1935_mat[s,]),
+        col=rgb(0.2,0.5,0.8,0.08), lwd=0.5)
+lines(ages_plot, log(mu_1935_med), col="steelblue", lwd=2)
+grid()
+legend("topleft",
+       legend=c("Observé HMD","100 simulations","Médiane"),
+       col=c("black",rgb(0.2,0.5,0.8,0.5),"steelblue"),
+       pch=c(16,NA,NA), lty=c(NA,1,1), lwd=c(NA,1,2), bty="n")
+```
+
+## Cohorte 1950 — depuis le contrat 2015
+
+```{r visu-sim-1950, fig.height=5}
+plot(ages_obs_1950, log(cohort_1950_obs),
+     type="p", pch=16, cex=0.8, col="black",
+     main="Cohorte 1950 — Historique + trajectoires simulées\n(depuis 2015)",
+     xlab="Âge", ylab=expression(log(mu[x])),
+     xlim=c(65,90), ylim=c(-6,0))
+for (s in 1:100)
+  lines(ages_plot, log(mu_1950_mat[s,]),
+        col=rgb(0.8,0.2,0.2,0.08), lwd=0.5)
+lines(ages_plot, log(mu_1950_med), col="firebrick", lwd=2)
+grid()
+legend("topleft",
+       legend=c("Observé HMD","100 simulations","Médiane"),
+       col=c("black",rgb(0.8,0.2,0.2,0.5),"firebrick"),
+       pch=c(16,NA,NA), lty=c(NA,1,1), lwd=c(NA,1,2), bty="n")
+```
+
+---
+
+# Calcul de la Valeur Actuelle Probable {#sec-q5}
+
+> **Question 5 — Calculer la VAP pour chaque scénario, donner la moyenne,
+> la variance, et proposer une tarification.**
+
+## Formule théorique
+
+Rente viagère à termes échus [@Matoussi2026 ; @Dickson2013] :
+$$a_x^{(s)} = \sum_{k=1}^{25} v^k \cdot {}_kp_x^{(s)}, \quad
+{}_kp_x^{(s)} = \prod_{j=0}^{k-1}(1 - q_{x+j}^{(s)}), \quad
+q_x = 1 - e^{-\mu_x}$$
+
+## Calcul
+
+```{r calcul-vap, cache=TRUE}
+i      <- 0.02
+v      <- 1/(1+i)
+T_proj <- 25
+
+compute_VAP <- function(mu_vec, v=1/1.02, T=25) {
+  qx  <- 1 - exp(-mu_vec)
+  kpx <- cumprod(1 - qx)
+  sum(v^(1:T) * kpx, na.rm=TRUE)
+}
+
+# mu_1935_mat et mu_1950_mat déjà calculés (5000 lignes × 25 colonnes)
+VAP_1935 <- apply(mu_1935_mat, 1, compute_VAP)
+VAP_1950 <- apply(mu_1950_mat, 1, compute_VAP)
+
+cat("=== Cohorte 1935 ===\n")
+cat("VAP moyenne :", round(mean(VAP_1935),4), "\n")
+cat("Variance    :", round(var(VAP_1935), 6), "\n")
+cat("Écart-type  :", round(sd(VAP_1935),  4), "\n")
+cat("IC 99%      : [", round(quantile(VAP_1935,0.005),4), ";",
+                       round(quantile(VAP_1935,0.995),4), "]\n")
+cat("\n=== Cohorte 1950 ===\n")
+cat("VAP moyenne :", round(mean(VAP_1950),4), "\n")
+cat("Variance    :", round(var(VAP_1950), 6), "\n")
+cat("Écart-type  :", round(sd(VAP_1950),  4), "\n")
+cat("IC 99%      : [", round(quantile(VAP_1950,0.005),4), ";",
+                       round(quantile(VAP_1950,0.995),4), "]\n")
+```
+
+## Tableau récapitulatif et tarification
+
+```{r tableau-recap}
+resultats <- data.frame(
+  Cohorte    = c("1935 (contrat 2000)", "1950 (contrat 2015)"),
+  VAP_moy    = round(c(mean(VAP_1935), mean(VAP_1950)), 4),
+  Variance   = round(c(var(VAP_1935),  var(VAP_1950)),  6),
+  Ecart_type = round(c(sd(VAP_1935),   sd(VAP_1950)),   4),
+  IC99_bas   = round(c(quantile(VAP_1935,0.005), quantile(VAP_1950,0.005)), 4),
+  IC99_haut  = round(c(quantile(VAP_1935,0.995), quantile(VAP_1950,0.995)), 4)
+)
+print(resultats)
+
+cat("\n--- Prime pure (tarification) pour une rente de 10 000 €/an ---\n")
+cat("Cohorte 1935 :", round(10000 * mean(VAP_1935)), "€\n")
+cat("Cohorte 1950 :", round(10000 * mean(VAP_1950)), "€\n")
+```
+
+
+## Tarification avec marge de sécurité {#sec-marge}
+
+> **Principe de la prime ajustée** [@Matoussi2026] :
+> $$\pi_A(X) = \mathbb{E}[X] + \alpha \cdot \text{Var}(X)$$
+> où $\alpha$ est le chargement de sécurité et $X$ est la VAP du contrat.
+
+```{r tarification-marge}
+alpha  <- 0.1    # chargement de sécurité (10%)
+z_95   <- 1.645  # quantile normal unilatéral 95%
+rente  <- 10000  # rente annuelle en euros
+
+# --- Prime ajustée par la variance (principe classique) ---
+pi_1935_var <- mean(VAP_1935) + alpha * var(VAP_1935)
+pi_1950_var <- mean(VAP_1950) + alpha * var(VAP_1950)
+
+# --- Prime ajustée par l'écart-type (quantile 95%) ---
+pi_1935_sd  <- mean(VAP_1935) + z_95 * sd(VAP_1935)
+pi_1950_sd  <- mean(VAP_1950) + z_95 * sd(VAP_1950)
+
+resultats_tarif <- data.frame(
+  Cohorte        = c("1935", "1950"),
+  Prime_pure     = round(rente * c(mean(VAP_1935), mean(VAP_1950))),
+  Prime_var      = round(rente * c(pi_1935_var,    pi_1950_var)),
+  Prime_quantile = round(rente * c(pi_1935_sd,     pi_1950_sd))
+)
+names(resultats_tarif) <- c("Cohorte",
+                             "Prime pure (€)",
+                             "Prime ajustée α·Var (€)",
+                             "Prime quantile 95% (€)")
+print(resultats_tarif)
+
+cat("\nJustification :\n")
+cat("Cohorte 1935 — σ =", round(sd(VAP_1935),4),
+    "→ chargement quantile :", round(rente*(pi_1935_sd - mean(VAP_1935))), "€\n")
+cat("Cohorte 1950 — σ =", round(sd(VAP_1950),4),
+    "→ chargement quantile :", round(rente*(pi_1950_sd - mean(VAP_1950))), "€\n")
+cat("Ratio des chargements (1950/1935) :",
+    round((pi_1950_sd - mean(VAP_1950)) / (pi_1935_sd - mean(VAP_1935)), 1), "\n")
+```
+
+**Interprétation :**
+
+- La **prime pure** reflète uniquement l'espérance de la VAP.
+- La **prime ajustée** intègre le risque de longévité via la variance ou l'écart-type.
+- Le chargement de sécurité est **~29× plus élevé** pour la cohorte 1950 (écart-type
+  0,2139 vs 0,0074) — traduisant la dépendance aux projections futures incertaines.
+- En pratique, l'assureur utilisera le **quantile à 95%** pour fixer la prime commerciale,
+  garantissant la solvabilité avec probabilité 95%.
+
+## Distribution des VAP
+
+```{r distribution-vap, fig.height=5}
+par(mfrow=c(1,2), mar=c(4,4,3,1))
+
+plot(density(VAP_1935), col="steelblue", lwd=2,
+     main="Distribution des VAP", xlab="VAP (€/euro de rente)", ylab="Densité")
+lines(density(VAP_1950), col="firebrick", lwd=2, lty=2)
+abline(v=mean(VAP_1935), col="steelblue", lty=3)
+abline(v=mean(VAP_1950), col="firebrick", lty=3)
+legend("topright", legend=c("Cohorte 1935","Cohorte 1950"),
+       col=c("steelblue","firebrick"), lwd=2, lty=c(1,2), bty="n")
+grid()
+
+boxplot(VAP_1935, VAP_1950,
+        names=c("Cohorte 1935","Cohorte 1950"),
+        col=c("lightblue","lightsalmon"),
+        main="Boxplot des VAP", ylab="VAP (€/euro de rente)",
+        border=c("steelblue","firebrick"))
+grid()
+```
+
+---
+
+# Interprétation des différences {#sec-q6}
+
+> **Question 6 — Interpréter la différence obtenue selon les deux cohortes.**
+
+```{r diff-recap}
+diff_VAP <- mean(VAP_1950) - mean(VAP_1935)
+diff_pct <- diff_VAP / mean(VAP_1935) * 100
+cat("Différence :", round(diff_VAP,4), "€ soit +", round(diff_pct,2), "%\n")
+```
+
+**1. Amélioration de la longévité entre générations.**
+Les hommes nés en 1950 ont une espérance de vie à 65 ans supérieure à
+ceux nés en 1935. La dérive négative de $k_t$ dans Lee-Carter [@LeeCarter1992]
+capture cette tendance : moins de mortalité = rente versée plus longtemps = VAP plus élevée.
+
+**2. Effet de la date de début du contrat.**
+Le contrat 1950 démarre en 2015, soit 15 ans après le contrat 1935.
+Les taux de mortalité ayant continué à baisser sur cette période,
+la cohorte 1950 bénéficie d'une mortalité encore plus faible [@Matoussi2026].
+
+**3. Incertitude plus grande pour la cohorte 1950.**
+La variance est 850 fois plus élevée pour 1950 que pour 1935. Explication :
+la cohorte 1935 a 21 ans sur 25 dans la plage historique (déterministe),
+tandis que la cohorte 1950 en a 24 ans dans la plage projetée (aléatoire).
+
+**4. Implication tarifaire.**
+C'est le **risque de longévité** [@Yon2017] : tarifer sans projeter
+l'amélioration future **sous-estime** la VAP réelle.
+
+---
+
+# Autres sources d'incertitudes {#sec-q7}
+
+> **Question 7 — Quelles sont les autres sources d'incertitudes ?**
+
+## 1. Risque de modèle
+
+Lee-Carter suppose $b_x$ constant dans le temps et ignore les effets
+cohorte [@Matoussi2026 ; @Villegas2018]. Des modèles alternatifs (CBD,
+APC) peuvent donner des projections différentes.
+
+## 2. Sensibilité à la période de calibration
+
+Calibrer sur 1950-2020 vs 1816-2020 change significativement la dérive
+de $k_t$ [@Matoussi2026]. Inclure les guerres mondiales sous-estimerait
+l'amélioration de la longévité.
+
+## 3. Risque de taux d'intérêt
+
+Le taux technique $i = 2\%$ est supposé constant sur 25 ans. Une baisse
+des taux augmente la VAP et crée des pertes techniques non anticipées.
+
+## 4. Indépendance des durées de vie
+
+Pandémies, facteurs socio-économiques communs, corrélations entre conjoints
+violent l'hypothèse iid et augmentent la variance réelle du portefeuille
+[@Matoussi2026].
+
+## 5. Anti-sélection
+
+Les souscripteurs de rentes sont en meilleure santé que la population
+générale. Les tables HMD sous-estiment donc la survie réelle du portefeuille
+[@Yon2017].
+
+## 6. Risque de censure
+
+Les rachats de contrat (censure type III, Section 2.1 du cours) biais la
+mortalité observée à la baisse si les assurés en mauvaise santé rachètent
+préférentiellement [@Matoussi2026].
+
+## 7. Fermeture de table aux grands âges
+
+Aux âges $x > 90$ ans, les effectifs sont faibles → taux instables.
+La méthode de Coale-Kisker (Section 4.5.3 du cours) introduit une
+incertitude supplémentaire [@Matoussi2026].
+
+## 8. Hétérogénéité du portefeuille
+
+Tabagisme, niveau socio-économique, région géographique (exercice 1.3 du
+cours) créent une dispersion non capturée par une table nationale unique.
+
+---
+
+# Conclusion
+
+1. Le modèle de Lee-Carter [@LeeCarter1992] estimé sous hypothèse
+   log-Poisson [@Brouhns2002] via `StMoMo` [@Villegas2018] fournit un
+   cadre cohérent pour la projection de la mortalité.
+
+2. La VAP de la cohorte 1950 (**14.56**) est supérieure de 5.25% à celle
+   de la cohorte 1935 (**13.83**), reflétant l'amélioration de la longévité.
+
+3. La simulation N=5000 quantifie l'incertitude : la variance pour 1950
+   est 850× plus grande, justifiant une marge de sécurité en tarification.
+
+4. De nombreuses sources d'incertitude subsistent, justifiant des marges
+   de sécurité en pratique [@Yon2017].
+
+---
+
+# Références {-}
